@@ -663,7 +663,27 @@ impl HttpClient for Client {
             request = request.header(header::IF_NONE_MATCH, etag.to_string());
         }
 
-        let response = request.send().await?;
+        const FORBIDDEN_RETRIES: usize = 3;
+        const FORBIDDEN_BACKOFF: Duration = Duration::from_secs(8);
+
+        let mut response = request
+            .try_clone()
+            .expect("GET request has no stream body and is always cloneable")
+            .send()
+            .await?;
+
+        for _ in 0..FORBIDDEN_RETRIES {
+            if response.status() != reqwest::StatusCode::FORBIDDEN {
+                break;
+            }
+            tokio::time::sleep(FORBIDDEN_BACKOFF).await;
+            response = request
+                .try_clone()
+                .expect("GET request has no stream body and is always cloneable")
+                .send()
+                .await?;
+        }
+
         self.handle_response(response).await
     }
 
@@ -1067,6 +1087,107 @@ mod tests {
 
         assert_eq!(task.location.0.to_string(), task_path);
         assert_eq!(task.retry_after, Some(Duration::from_secs(15)));
+
+        Ok(())
+    }
+
+    // A client with no request/connect timeouts. Under `start_paused`, tokio
+    // auto-advances virtual time to the next pending timer whenever the runtime
+    // is idle. The default client's 5s connect-timeout would fire that way and
+    // kill the request mid-connect, so the retry tests strip those timers and
+    // leave the 8s backoff as the only timer to advance past.
+    fn untimed_client() -> Result<Client, reqwest::Error> {
+        Client::with_params(ClientParams {
+            timeout: None,
+            connect_timeout: None,
+            tcp_keepalive: None,
+            pool_idle_timeout: None,
+            ..ClientParams::default()
+        })
+    }
+
+    // `get` retries up to `FORBIDDEN_RETRIES` times on a 403, so a sequence of
+    // three 403s followed by a 200 must ultimately succeed (4 requests total:
+    // the initial attempt plus three retries). `start_paused` auto-advances the
+    // virtual clock past the 8s backoffs so the test stays fast.
+    #[tokio::test(start_paused = true)]
+    async fn test_get_retries_on_forbidden_then_succeeds() -> Result<(), Box<dyn StdError>> {
+        let mock_server = MockServer::start().await;
+        let resource_path = "/redfish/v1/Systems/1";
+
+        // Higher priority (1) and capped at 3 matches: the first three GETs get
+        // 403, then this mock is exhausted and stops matching.
+        Mock::given(method("GET"))
+            .and(path(resource_path))
+            .respond_with(ResponseTemplate::new(403))
+            .up_to_n_times(3)
+            .with_priority(1)
+            .expect(3)
+            .mount(&mock_server)
+            .await;
+
+        // Lower (default) priority: only reached once the 403 mock is exhausted.
+        Mock::given(method("GET"))
+            .and(path(resource_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "@odata.id": resource_path })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = untimed_client()?;
+        let credentials = BmcCredentials::new("root".to_string(), "password".to_string());
+
+        let resource: serde_json::Value = client
+            .get(
+                Url::parse(&format!("{}{resource_path}", mock_server.uri()))?,
+                &credentials,
+                None,
+                &HeaderMap::new(),
+            )
+            .await?;
+
+        assert_eq!(resource["@odata.id"], resource_path);
+
+        // Mock `expect` assertions are verified here on drop.
+        Ok(())
+    }
+
+    // When every attempt returns 403, `get` exhausts its retries and surfaces
+    // the 403 to the caller. This pins the attempt count at 1 + FORBIDDEN_RETRIES.
+    #[tokio::test(start_paused = true)]
+    async fn test_get_gives_up_after_forbidden_retries() -> Result<(), Box<dyn StdError>> {
+        let mock_server = MockServer::start().await;
+        let resource_path = "/redfish/v1/Systems/1";
+
+        // Initial attempt + 3 retries, all 403.
+        Mock::given(method("GET"))
+            .and(path(resource_path))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(4)
+            .mount(&mock_server)
+            .await;
+
+        let client = untimed_client()?;
+        let credentials = BmcCredentials::new("root".to_string(), "password".to_string());
+
+        let result: Result<serde_json::Value, _> = client
+            .get(
+                Url::parse(&format!("{}{resource_path}", mock_server.uri()))?,
+                &credentials,
+                None,
+                &HeaderMap::new(),
+            )
+            .await;
+
+        match result {
+            Err(BmcError::InvalidResponse { status, .. }) => {
+                assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+            }
+            other => return Err(format!("expected 403 InvalidResponse, got {other:?}").into()),
+        }
 
         Ok(())
     }
