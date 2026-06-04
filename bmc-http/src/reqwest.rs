@@ -45,6 +45,7 @@ use nv_redfish_core::UploadStream;
 use reqwest::multipart::Form;
 use reqwest::multipart::Part;
 use reqwest::redirect::Policy as RedirectPolicy;
+use reqwest::retry::Builder as RetryBuilder;
 use reqwest::Client as ReqwestClient;
 use reqwest::Error as ReqwestError;
 use serde::de::DeserializeOwned;
@@ -52,7 +53,6 @@ use serde::Serialize;
 use tokio_util::compat::FuturesAsyncReadCompatExt as _;
 use tokio_util::io::ReaderStream;
 use url::Url;
-
 /// Errors of reqwest implementation of the HTTP trait.
 #[derive(Debug)]
 pub enum BmcError {
@@ -162,7 +162,7 @@ impl StdErr for BmcError {
 ///     .user_agent("MyApp/1.0")
 ///     .accept_invalid_certs(true);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ClientParams {
     /// HTTP request timeout
     pub timeout: Option<Duration>,
@@ -184,6 +184,8 @@ pub struct ClientParams {
     pub default_headers: Option<HeaderMap>,
     /// Forces use of rust TLS, enabled by default
     pub use_rust_tls: bool,
+    /// None keeps the reqwest default behavior
+    pub retry: Option<RetryBuilder>,
 }
 
 impl Default for ClientParams {
@@ -199,6 +201,7 @@ impl Default for ClientParams {
             pool_max_idle_per_host: Some(1),
             default_headers: None,
             use_rust_tls: true,
+            retry: None,
         }
     }
 }
@@ -279,6 +282,13 @@ impl ClientParams {
         self.default_headers = Some(default_headers);
         self
     }
+
+    /// See: [`reqwest::ClientBuilder::retry`]
+    #[must_use]
+    pub fn retry(mut self, retry: RetryBuilder) -> Self {
+        self.retry = Some(retry);
+        self
+    }
 }
 
 /// HTTP client implementation using the reqwest library.
@@ -349,6 +359,10 @@ impl Client {
 
         if let Some(default_headers) = params.default_headers {
             builder = builder.default_headers(default_headers);
+        }
+
+        if let Some(retry) = params.retry {
+            builder = builder.retry(retry);
         }
 
         Ok(Self {
@@ -974,6 +988,126 @@ mod tests {
 
         let created_miss = BmcError::cache_miss();
         assert!(matches!(created_miss, BmcError::CacheMiss));
+    }
+
+    /// Retry policy used in tests: retries GET requests on 503 responses.
+    fn test_retry_policy(max_retries: u32) -> RetryBuilder {
+        retry::for_host("127.0.0.1")
+            .max_retries_per_request(max_retries)
+            .classify_fn(|req_rep| match (req_rep.method(), req_rep.status()) {
+                (&http::Method::GET, Some(http::StatusCode::SERVICE_UNAVAILABLE)) => {
+                    req_rep.retryable()
+                }
+                _ => req_rep.success(),
+            })
+    }
+
+    #[tokio::test]
+    async fn test_get_is_retried_on_retryable_status() -> Result<(), Box<dyn StdError>> {
+        let mock_server = MockServer::start().await;
+        let resource_path = "/redfish/v1";
+
+        Mock::given(method("GET"))
+            .and(path(resource_path))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(resource_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "@odata.id": resource_path })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = Client::with_params(ClientParams::new().retry(test_retry_policy(2)))?;
+        let credentials = BmcCredentials::new("root".to_string(), "password".to_string());
+
+        let response: serde_json::Value = client
+            .get(
+                Url::parse(&format!("{}{resource_path}", mock_server.uri()))?,
+                &credentials,
+                None,
+                &HeaderMap::new(),
+            )
+            .await?;
+
+        assert_eq!(response["@odata.id"], resource_path);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_post_is_not_retried_when_excluded_by_classifier() -> Result<(), Box<dyn StdError>>
+    {
+        let mock_server = MockServer::start().await;
+        let resource_path = "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset";
+
+        Mock::given(method("POST"))
+            .and(path(resource_path))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = Client::with_params(ClientParams::new().retry(test_retry_policy(2)))?;
+        let credentials = BmcCredentials::new("root".to_string(), "password".to_string());
+
+        let response = client
+            .post::<_, serde_json::Value>(
+                Url::parse(&format!("{}{resource_path}", mock_server.uri()))?,
+                &serde_json::json!({ "ResetType": "On" }),
+                &credentials,
+                &HeaderMap::new(),
+            )
+            .await;
+
+        assert!(matches!(
+            response,
+            Err(BmcError::InvalidResponse { status, .. })
+                if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_retries_stop_at_max_retries_per_request() -> Result<(), Box<dyn StdError>> {
+        let mock_server = MockServer::start().await;
+        let resource_path = "/redfish/v1";
+
+        // Original request + 1 retry, even though the server keeps failing.
+        Mock::given(method("GET"))
+            .and(path(resource_path))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let client = Client::with_params(ClientParams::new().retry(test_retry_policy(1)))?;
+        let credentials = BmcCredentials::new("root".to_string(), "password".to_string());
+
+        let response = client
+            .get::<serde_json::Value>(
+                Url::parse(&format!("{}{resource_path}", mock_server.uri()))?,
+                &credentials,
+                None,
+                &HeaderMap::new(),
+            )
+            .await;
+
+        assert!(matches!(
+            response,
+            Err(BmcError::InvalidResponse { status, .. })
+                if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+
+        Ok(())
     }
 
     #[tokio::test]
