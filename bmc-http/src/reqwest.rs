@@ -53,6 +53,11 @@ use serde::Serialize;
 use tokio_util::compat::FuturesAsyncReadCompatExt as _;
 use tokio_util::io::ReaderStream;
 use url::Url;
+
+/// Re-export of [`reqwest::retry`] for building [`ClientParams::retry`]
+/// policies without depending on reqwest directly.
+pub use reqwest::retry;
+
 /// Errors of reqwest implementation of the HTTP trait.
 #[derive(Debug)]
 pub enum BmcError {
@@ -951,7 +956,6 @@ mod tests {
     use super::*;
 
     use futures_util::io::Cursor;
-    use reqwest::retry;
     use wiremock::matchers::header;
     use wiremock::matchers::method;
     use wiremock::matchers::path;
