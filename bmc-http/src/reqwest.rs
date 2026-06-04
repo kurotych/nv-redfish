@@ -951,6 +951,7 @@ mod tests {
     use super::*;
 
     use futures_util::io::Cursor;
+    use reqwest::retry;
     use wiremock::matchers::header;
     use wiremock::matchers::method;
     use wiremock::matchers::path;
