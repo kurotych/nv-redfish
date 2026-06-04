@@ -17,6 +17,7 @@
 
 use std::error::Error as StdErr;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::schema::redfish::message::Message;
@@ -45,18 +46,14 @@ use nv_redfish_core::UploadStream;
 use reqwest::multipart::Form;
 use reqwest::multipart::Part;
 use reqwest::redirect::Policy as RedirectPolicy;
-use reqwest::retry::Builder as RetryBuilder;
 use reqwest::Client as ReqwestClient;
 use reqwest::Error as ReqwestError;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use tokio::time::sleep;
 use tokio_util::compat::FuturesAsyncReadCompatExt as _;
 use tokio_util::io::ReaderStream;
 use url::Url;
-
-/// Re-export of [`reqwest::retry`] for building [`ClientParams::retry`]
-/// policies without depending on reqwest directly.
-pub use reqwest::retry;
 
 /// Errors of reqwest implementation of the HTTP trait.
 #[derive(Debug)]
@@ -150,6 +147,84 @@ impl StdErr for BmcError {
     }
 }
 
+/// Classifier deciding whether a response should be retried.
+///
+/// Receives the request method and the response status code, returns `true`
+/// if the request should be retried.
+type RetryClassifier = dyn Fn(&http::Method, http::StatusCode) -> bool + Send + Sync + 'static;
+
+/// Retry policy with a configurable delay between attempts.
+///
+/// Retries apply only to received HTTP responses; transport and connection
+/// errors are returned immediately. Requests with non-clonable (streaming)
+/// bodies, such as multipart uploads, are sent exactly once and never retried.
+///
+/// # Examples
+///
+/// ```rust
+/// use nv_redfish_bmc_http::reqwest::{ClientParams, RetryPolicy};
+/// use std::time::Duration;
+///
+/// let policy = RetryPolicy::new(|method, status| {
+///     *method == http::Method::GET && status == http::StatusCode::SERVICE_UNAVAILABLE
+/// })
+/// .max_retries(3)
+/// .delay(Duration::from_millis(500));
+///
+/// let params = ClientParams::new().retry(policy);
+/// ```
+#[derive(Clone)]
+pub struct RetryPolicy {
+    /// Number of extra attempts after the first one.
+    max_retries: u32,
+    /// Fixed sleep between attempts.
+    delay: Duration,
+    /// Decides whether a response should be retried.
+    classifier: Arc<RetryClassifier>,
+}
+
+impl RetryPolicy {
+    /// Creates a policy that retries responses accepted by `classifier`.
+    ///
+    /// By default no retries are performed; configure them with
+    /// [`Self::max_retries`] and [`Self::delay`].
+    #[must_use]
+    pub fn new<F>(classifier: F) -> Self
+    where
+        F: Fn(&http::Method, http::StatusCode) -> bool + Send + Sync + 'static,
+    {
+        Self {
+            max_retries: 0,
+            delay: Duration::from_secs(0),
+            classifier: Arc::new(classifier),
+        }
+    }
+
+    /// Maximum number of extra attempts after the initial request.
+    #[must_use]
+    pub const fn max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    /// Fixed delay to sleep between attempts.
+    #[must_use]
+    pub const fn delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+}
+
+impl fmt::Debug for RetryPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetryPolicy")
+            .field("max_retries", &self.max_retries)
+            .field("delay", &self.delay)
+            .field("classifier", &"<closure>")
+            .finish()
+    }
+}
+
 /// Configuration parameters for the reqwest HTTP client.
 ///
 /// This struct allows customizing various aspects of the reqwest client behavior,
@@ -167,7 +242,7 @@ impl StdErr for BmcError {
 ///     .user_agent("MyApp/1.0")
 ///     .accept_invalid_certs(true);
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClientParams {
     /// HTTP request timeout
     pub timeout: Option<Duration>,
@@ -189,8 +264,8 @@ pub struct ClientParams {
     pub default_headers: Option<HeaderMap>,
     /// Forces use of rust TLS, enabled by default
     pub use_rust_tls: bool,
-    /// None keeps the reqwest default behavior
-    pub retry: Option<RetryBuilder>,
+    /// Retry policy for received responses, `None` disables retries
+    pub retry: Option<RetryPolicy>,
 }
 
 impl Default for ClientParams {
@@ -288,9 +363,9 @@ impl ClientParams {
         self
     }
 
-    /// See: [`reqwest::ClientBuilder::retry`]
+    /// Sets the [`RetryPolicy`] applied to every request.
     #[must_use]
-    pub fn retry(mut self, retry: RetryBuilder) -> Self {
+    pub fn retry(mut self, retry: RetryPolicy) -> Self {
         self.retry = Some(retry);
         self
     }
@@ -304,6 +379,7 @@ impl ClientParams {
 #[derive(Clone)]
 pub struct Client {
     client: ReqwestClient,
+    retry: Option<RetryPolicy>,
 }
 
 impl Client {
@@ -366,23 +442,55 @@ impl Client {
             builder = builder.default_headers(default_headers);
         }
 
-        if let Some(retry) = params.retry {
-            builder = builder.retry(retry);
-        }
-
         Ok(Self {
             client: builder.build()?,
+            retry: params.retry,
         })
     }
 
     /// Use pre-built [`reqwest::Client`] as internal client.
     #[must_use]
     pub const fn with_client(client: ReqwestClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            retry: None,
+        }
     }
 }
 
 impl Client {
+    /// Sends the request, retrying according to the configured [`RetryPolicy`].
+    ///
+    /// Transport errors are returned immediately. Requests with streaming
+    /// bodies cannot be cloned and are sent exactly once.
+    async fn send(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response, BmcError> {
+        let Some(policy) = &self.retry else {
+            return Ok(request.send().await?);
+        };
+
+        let mut attempt: u32 = 0;
+        let mut current = request;
+        loop {
+            let is_last = attempt >= policy.max_retries;
+            // try_clone() must precede build() since build() consumes the
+            // builder. It returns None for streaming bodies, which therefore
+            // get a single attempt.
+            let next = if is_last { None } else { current.try_clone() };
+            let built = current.build()?;
+            let method = built.method().clone();
+            let response = self.client.execute(built).await?;
+            let retryable = (policy.classifier)(&method, response.status());
+            match next {
+                Some(next_request) if retryable => {
+                    sleep(policy.delay).await;
+                    current = next_request;
+                    attempt += 1;
+                }
+                _ => return Ok(response),
+            }
+        }
+    }
+
     async fn handle_response<T>(&self, response: reqwest::Response) -> Result<T, BmcError>
     where
         T: DeserializeOwned,
@@ -686,7 +794,7 @@ impl HttpClient for Client {
             request = request.header(header::IF_NONE_MATCH, etag.to_string());
         }
 
-        let response = request.send().await?;
+        let response = self.send(request).await?;
         self.handle_response(response).await
     }
 
@@ -701,12 +809,11 @@ impl HttpClient for Client {
         B: Serialize + Send + Sync,
         T: DeserializeOwned + Send + Sync,
     {
-        let response = auth_headers(self.client.post(url), credentials)
+        let request = auth_headers(self.client.post(url), credentials)
             .headers(custom_headers.clone())
-            .json(body)
-            .send()
-            .await?;
+            .json(body);
 
+        let response = self.send(request).await?;
         self.handle_modification_response(response).await
     }
 
@@ -720,14 +827,13 @@ impl HttpClient for Client {
         B: Serialize + Send + Sync,
         T: DeserializeOwned + Send + Sync,
     {
-        let response = self
+        let request = self
             .client
             .post(url)
             .headers(custom_headers.clone())
-            .json(body)
-            .send()
-            .await?;
+            .json(body);
 
+        let response = self.send(request).await?;
         self.handle_session_response(response).await
     }
 
@@ -748,7 +854,7 @@ impl HttpClient for Client {
 
         request = request.header(header::IF_MATCH, etag.to_string());
 
-        let response = request.json(body).send().await?;
+        let response = self.send(request.json(body)).await?;
         self.handle_modification_response(response).await
     }
 
@@ -761,11 +867,10 @@ impl HttpClient for Client {
     where
         T: DeserializeOwned + Send + Sync,
     {
-        let response = auth_headers(self.client.delete(url), credentials)
-            .headers(custom_headers.clone())
-            .send()
-            .await?;
+        let request =
+            auth_headers(self.client.delete(url), credentials).headers(custom_headers.clone());
 
+        let response = self.send(request).await?;
         self.handle_modification_response(response).await
     }
 
@@ -810,13 +915,12 @@ impl HttpClient for Client {
             form = form.part(name, part);
         }
 
-        let response = auth_headers(self.client.post(url), credentials)
+        let request = auth_headers(self.client.post(url), credentials)
             .headers(custom_headers.clone())
             .multipart(form)
-            .timeout(upload_timeout)
-            .send()
-            .await?;
+            .timeout(upload_timeout);
 
+        let response = self.send(request).await?;
         self.handle_modification_response(response).await
     }
 
@@ -854,7 +958,7 @@ impl HttpClient for Client {
             request = request.header(header::CONTENT_LENGTH, content_length.to_string());
         }
 
-        let response = request.send().await?;
+        let response = self.send(request).await?;
         self.handle_modification_response(response).await
     }
 
@@ -864,12 +968,12 @@ impl HttpClient for Client {
         credentials: &BmcCredentials,
         custom_headers: &HeaderMap,
     ) -> Result<BoxTryStream<T, Self::Error>, Self::Error> {
-        let response = auth_headers(self.client.get(url), credentials)
+        let request = auth_headers(self.client.get(url), credentials)
             .headers(custom_headers.clone())
             .header(header::ACCEPT, "text/event-stream")
-            .timeout(Duration::MAX)
-            .send()
-            .await?;
+            .timeout(Duration::MAX);
+
+        let response = self.send(request).await?;
 
         if !response.status().is_success() {
             return Err(BmcError::InvalidResponse {
@@ -996,28 +1100,26 @@ mod tests {
     }
 
     /// Retry policy used in tests: retries GET requests on 503 responses.
-    fn test_retry_policy(max_retries: u32) -> RetryBuilder {
-        retry::for_host("127.0.0.1")
-            .max_retries_per_request(max_retries)
-            .classify_fn(|req_rep| match (req_rep.method(), req_rep.status()) {
-                (&http::Method::GET, Some(http::StatusCode::SERVICE_UNAVAILABLE)) => {
-                    req_rep.retryable()
-                }
-                _ => req_rep.success(),
-            })
+    fn test_retry_policy(max_retries: u32, delay: Duration) -> RetryPolicy {
+        RetryPolicy::new(|method, status| {
+            *method == http::Method::GET && status == http::StatusCode::SERVICE_UNAVAILABLE
+        })
+        .max_retries(max_retries)
+        .delay(delay)
     }
 
-    #[tokio::test]
-    async fn test_get_is_retried_on_retryable_status() -> Result<(), Box<dyn StdError>> {
-        let mock_server = MockServer::start().await;
-        let resource_path = "/redfish/v1";
-
+    /// Mounts mocks that respond with `unavailable` 503s followed by a 200.
+    async fn mount_unavailable_then_ok(
+        mock_server: &MockServer,
+        resource_path: &str,
+        unavailable: u64,
+    ) {
         Mock::given(method("GET"))
             .and(path(resource_path))
             .respond_with(ResponseTemplate::new(503))
-            .up_to_n_times(2)
-            .expect(2)
-            .mount(&mock_server)
+            .up_to_n_times(unavailable)
+            .expect(unavailable)
+            .mount(mock_server)
             .await;
 
         Mock::given(method("GET"))
@@ -1027,10 +1129,19 @@ mod tests {
                     .set_body_json(serde_json::json!({ "@odata.id": resource_path })),
             )
             .expect(1)
-            .mount(&mock_server)
+            .mount(mock_server)
             .await;
+    }
 
-        let client = Client::with_params(ClientParams::new().retry(test_retry_policy(2)))?;
+    #[tokio::test]
+    async fn test_get_is_retried_on_retryable_status() -> Result<(), Box<dyn StdError>> {
+        let mock_server = MockServer::start().await;
+        let resource_path = "/redfish/v1";
+        mount_unavailable_then_ok(&mock_server, resource_path, 2).await;
+
+        let client = Client::with_params(
+            ClientParams::new().retry(test_retry_policy(2, Duration::from_millis(0))),
+        )?;
         let credentials = BmcCredentials::new("root".to_string(), "password".to_string());
 
         let response: serde_json::Value = client
@@ -1042,6 +1153,34 @@ mod tests {
             )
             .await?;
 
+        assert_eq!(response["@odata.id"], resource_path);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_retry_delay_is_observed() -> Result<(), Box<dyn StdError>> {
+        let mock_server = MockServer::start().await;
+        let resource_path = "/redfish/v1";
+        mount_unavailable_then_ok(&mock_server, resource_path, 2).await;
+
+        let delay = Duration::from_millis(100);
+        let client = Client::with_params(ClientParams::new().retry(test_retry_policy(2, delay)))?;
+        let credentials = BmcCredentials::new("root".to_string(), "password".to_string());
+
+        let started = std::time::Instant::now();
+        let response: serde_json::Value = client
+            .get(
+                Url::parse(&format!("{}{resource_path}", mock_server.uri()))?,
+                &credentials,
+                None,
+                &HeaderMap::new(),
+            )
+            .await?;
+
+        // Two retries mean two sleeps; only assert the lower bound to keep
+        // the test robust on slow CI machines.
+        assert!(started.elapsed() >= Duration::from_millis(180));
         assert_eq!(response["@odata.id"], resource_path);
 
         Ok(())
