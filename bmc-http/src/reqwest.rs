@@ -177,8 +177,8 @@ type RetryClassifier = dyn Fn(&http::Method, http::StatusCode) -> bool + Send + 
 pub struct RetryPolicy {
     /// Number of extra attempts after the first one.
     max_retries: u32,
-    /// Fixed sleep between attempts.
-    delay: Duration,
+    /// Fixed sleep between attempts; `None` retries immediately.
+    delay: Option<Duration>,
     /// Decides whether a response should be retried.
     classifier: Arc<RetryClassifier>,
 }
@@ -195,7 +195,7 @@ impl RetryPolicy {
     {
         Self {
             max_retries: 0,
-            delay: Duration::from_secs(0),
+            delay: None,
             classifier: Arc::new(classifier),
         }
     }
@@ -210,7 +210,7 @@ impl RetryPolicy {
     /// Fixed delay to sleep between attempts.
     #[must_use]
     pub const fn delay(mut self, delay: Duration) -> Self {
-        self.delay = delay;
+        self.delay = Some(delay);
         self
     }
 }
@@ -482,7 +482,9 @@ impl Client {
             let retryable = (policy.classifier)(&method, response.status());
             match next {
                 Some(next_request) if retryable => {
-                    sleep(policy.delay).await;
+                    if let Some(delay) = policy.delay {
+                        sleep(delay).await;
+                    }
                     current = next_request;
                     attempt += 1;
                 }
