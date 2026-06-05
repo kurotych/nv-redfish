@@ -111,10 +111,11 @@ mod reqwest_client_tests {
             .mount(&mock_server)
             .await;
 
-        let policy =
-            RetryPolicy::new(|_method, status| status == http::StatusCode::SERVICE_UNAVAILABLE)
-                .max_retries(1)
-                .delay(Duration::from_millis(10));
+        let policy = RetryPolicy::new(|_request, response| {
+            response.status() == http::StatusCode::SERVICE_UNAVAILABLE
+        })
+        .max_retries(1)
+        .delay(Duration::from_millis(10));
 
         let client = Client::with_params(ClientParams::new().retry(policy))?;
         let bmc = HttpBmc::new(

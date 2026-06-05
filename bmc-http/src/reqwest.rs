@@ -149,9 +149,10 @@ impl StdErr for BmcError {
 
 /// Classifier deciding whether a response should be retried.
 ///
-/// Receives the request method and the response status code, returns `true`
-/// if the request should be retried.
-type RetryClassifier = dyn Fn(&http::Method, http::StatusCode) -> bool + Send + Sync + 'static;
+/// Receives the request and the response, returns `true` if the request
+/// should be retried.
+type RetryClassifier =
+    dyn Fn(&reqwest::Request, &reqwest::Response) -> bool + Send + Sync + 'static;
 
 /// Retry policy with a configurable delay between attempts.
 ///
@@ -165,8 +166,9 @@ type RetryClassifier = dyn Fn(&http::Method, http::StatusCode) -> bool + Send + 
 /// use nv_redfish_bmc_http::reqwest::{ClientParams, RetryPolicy};
 /// use std::time::Duration;
 ///
-/// let policy = RetryPolicy::new(|method, status| {
-///     *method == http::Method::GET && status == http::StatusCode::SERVICE_UNAVAILABLE
+/// let policy = RetryPolicy::new(|request, response| {
+///     *request.method() == http::Method::GET
+///         && response.status() == http::StatusCode::SERVICE_UNAVAILABLE
 /// })
 /// .max_retries(3)
 /// .delay(Duration::from_millis(500));
@@ -191,7 +193,7 @@ impl RetryPolicy {
     #[must_use]
     pub fn new<F>(classifier: F) -> Self
     where
-        F: Fn(&http::Method, http::StatusCode) -> bool + Send + Sync + 'static,
+        F: Fn(&reqwest::Request, &reqwest::Response) -> bool + Send + Sync + 'static,
     {
         Self {
             max_retries: 0,
@@ -463,25 +465,23 @@ impl Client {
     ///
     /// Transport errors are returned immediately. Requests with streaming
     /// bodies cannot be cloned and are sent exactly once.
-    async fn send(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response, BmcError> {
+    async fn send(&self, request: reqwest::Request) -> Result<reqwest::Response, BmcError> {
         let Some(policy) = &self.retry else {
-            return Ok(request.send().await?);
+            return Ok(self.client.execute(request).await?);
         };
 
         let mut attempt: u32 = 0;
         let mut current = request;
         loop {
             let is_last = attempt >= policy.max_retries;
-            // try_clone() must precede build() since build() consumes the
-            // builder. It returns None for streaming bodies, which therefore
+            // try_clone() returns None for streaming bodies, which therefore
             // get a single attempt.
             let next = if is_last { None } else { current.try_clone() };
-            let built = current.build()?;
-            let method = built.method().clone();
-            let response = self.client.execute(built).await?;
-            let retryable = (policy.classifier)(&method, response.status());
+            let response = self.client.execute(current).await?;
             match next {
-                Some(next_request) if retryable => {
+                // The clone is identical to the request just sent, so the
+                // classifier sees what went over the wire.
+                Some(next_request) if (policy.classifier)(&next_request, &response) => {
                     if let Some(delay) = policy.delay {
                         sleep(delay).await;
                     }
@@ -796,7 +796,7 @@ impl HttpClient for Client {
             request = request.header(header::IF_NONE_MATCH, etag.to_string());
         }
 
-        let response = self.send(request).await?;
+        let response = self.send(request.build()?).await?;
         self.handle_response(response).await
     }
 
@@ -815,7 +815,7 @@ impl HttpClient for Client {
             .headers(custom_headers.clone())
             .json(body);
 
-        let response = self.send(request).await?;
+        let response = self.send(request.build()?).await?;
         self.handle_modification_response(response).await
     }
 
@@ -835,7 +835,7 @@ impl HttpClient for Client {
             .headers(custom_headers.clone())
             .json(body);
 
-        let response = self.send(request).await?;
+        let response = self.send(request.build()?).await?;
         self.handle_session_response(response).await
     }
 
@@ -856,7 +856,7 @@ impl HttpClient for Client {
 
         request = request.header(header::IF_MATCH, etag.to_string());
 
-        let response = self.send(request.json(body)).await?;
+        let response = self.send(request.json(body).build()?).await?;
         self.handle_modification_response(response).await
     }
 
@@ -872,7 +872,7 @@ impl HttpClient for Client {
         let request =
             auth_headers(self.client.delete(url), credentials).headers(custom_headers.clone());
 
-        let response = self.send(request).await?;
+        let response = self.send(request.build()?).await?;
         self.handle_modification_response(response).await
     }
 
@@ -922,7 +922,7 @@ impl HttpClient for Client {
             .multipart(form)
             .timeout(upload_timeout);
 
-        let response = self.send(request).await?;
+        let response = self.send(request.build()?).await?;
         self.handle_modification_response(response).await
     }
 
@@ -960,7 +960,7 @@ impl HttpClient for Client {
             request = request.header(header::CONTENT_LENGTH, content_length.to_string());
         }
 
-        let response = self.send(request).await?;
+        let response = self.send(request.build()?).await?;
         self.handle_modification_response(response).await
     }
 
@@ -975,7 +975,7 @@ impl HttpClient for Client {
             .header(header::ACCEPT, "text/event-stream")
             .timeout(Duration::MAX);
 
-        let response = self.send(request).await?;
+        let response = self.send(request.build()?).await?;
 
         if !response.status().is_success() {
             return Err(BmcError::InvalidResponse {
@@ -1103,8 +1103,9 @@ mod tests {
 
     /// Retry policy used in tests: retries GET requests on 503 responses.
     fn test_retry_policy(max_retries: u32, delay: Option<Duration>) -> RetryPolicy {
-        let policy = RetryPolicy::new(|method, status| {
-            *method == http::Method::GET && status == http::StatusCode::SERVICE_UNAVAILABLE
+        let policy = RetryPolicy::new(|request, response| {
+            *request.method() == http::Method::GET
+                && response.status() == http::StatusCode::SERVICE_UNAVAILABLE
         })
         .max_retries(max_retries);
         match delay {
