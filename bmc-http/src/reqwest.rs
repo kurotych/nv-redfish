@@ -1192,6 +1192,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_streaming_body_is_not_retried() -> Result<(), Box<dyn StdError>> {
+        let mock_server = MockServer::start().await;
+        let upload_path = "/redfish/v1/UpdateService/update-multipart";
+
+        // Exactly one request must reach the server even though the policy
+        // retries every 503: try_clone() returns None for streaming bodies,
+        // which therefore get a single attempt.
+        Mock::given(method("POST"))
+            .and(path(upload_path))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let policy = RetryPolicy::new(|_request, response| {
+            response.status() == http::StatusCode::SERVICE_UNAVAILABLE
+        })
+        .max_retries(3);
+        let client = Client::with_params(ClientParams::new().retry(policy))?;
+        let credentials = BmcCredentials::new("root".to_string(), "password".to_string());
+
+        let params = MultipartParameters {
+            force_update: true,
+            targets: vec!["/redfish/v1/Systems/1".to_string()],
+        };
+
+        let update_stream =
+            DataStream::new("firmware.bin", Cursor::new(b"firmware-bytes".to_vec()))
+                .with_content_length(14);
+
+        let update_request = MultipartUpdateRequest {
+            update_parameters: &params,
+            update_stream,
+            oem_parts: vec![],
+            upload_timeout: Duration::from_secs(600),
+        };
+
+        let response = client
+            .post_multipart_update::<_, _, serde_json::Value>(
+                Url::parse(&format!("{}{upload_path}", mock_server.uri()))?,
+                update_request,
+                &credentials,
+                &HeaderMap::new(),
+            )
+            .await;
+
+        assert!(matches!(
+            response,
+            Err(BmcError::InvalidResponse { status, .. })
+                if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_multipart_form_fails_oem_validation() -> Result<(), Box<dyn StdError>> {
         let mock_server = MockServer::start().await;
         let upload_path = "/redfish/v1/UpdateService/update-multipart";
