@@ -1102,12 +1102,15 @@ mod tests {
     }
 
     /// Retry policy used in tests: retries GET requests on 503 responses.
-    fn test_retry_policy(max_retries: u32, delay: Duration) -> RetryPolicy {
-        RetryPolicy::new(|method, status| {
+    fn test_retry_policy(max_retries: u32, delay: Option<Duration>) -> RetryPolicy {
+        let policy = RetryPolicy::new(|method, status| {
             *method == http::Method::GET && status == http::StatusCode::SERVICE_UNAVAILABLE
         })
-        .max_retries(max_retries)
-        .delay(delay)
+        .max_retries(max_retries);
+        match delay {
+            Some(delay) => policy.delay(delay),
+            None => policy,
+        }
     }
 
     /// Mounts mocks that respond with `unavailable` 503s followed by a 200.
@@ -1141,9 +1144,7 @@ mod tests {
         let resource_path = "/redfish/v1";
         mount_unavailable_then_ok(&mock_server, resource_path, 2).await;
 
-        let client = Client::with_params(
-            ClientParams::new().retry(test_retry_policy(2, Duration::from_millis(0))),
-        )?;
+        let client = Client::with_params(ClientParams::new().retry(test_retry_policy(2, None)))?;
         let credentials = BmcCredentials::new("root".to_string(), "password".to_string());
 
         let response: serde_json::Value = client
@@ -1167,7 +1168,8 @@ mod tests {
         mount_unavailable_then_ok(&mock_server, resource_path, 2).await;
 
         let delay = Duration::from_millis(100);
-        let client = Client::with_params(ClientParams::new().retry(test_retry_policy(2, delay)))?;
+        let client =
+            Client::with_params(ClientParams::new().retry(test_retry_policy(2, Some(delay))))?;
         let credentials = BmcCredentials::new("root".to_string(), "password".to_string());
 
         let started = std::time::Instant::now();
